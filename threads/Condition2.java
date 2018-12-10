@@ -39,9 +39,10 @@ public class Condition2 {
 	
 	waitQueue.add(KThread.currentThread());
 	KThread.sleep(); // atomically go to sleep
+	conditionLock.acquire();
 	Machine.interrupt().restore(intStatus);
 	threadCount++;
-	conditionLock.acquire();
+	
     }
 
     /**

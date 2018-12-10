@@ -190,10 +190,14 @@ public class KThread {
 
 	Lib.assertTrue(toBeDestroyed == null);
 	toBeDestroyed = currentThread;
-
-
 	currentThread.status = statusFinished;
 	
+	KThread wThread = currentThread.waitJoinQueue.nextThread(); 
+	while (wThread != null)
+	{
+		wThread.ready(); 
+		wThread = currentThread.waitJoinQueue.nextThread();
+	}
 	sleep();
     }
 
