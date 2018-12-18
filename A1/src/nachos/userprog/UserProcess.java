@@ -1,13 +1,13 @@
 package nachos.userprog;
 
 import nachos.machine.*;
-import nachos.threads.KThread;
 import nachos.threads.Semaphore;
 import nachos.threads.ThreadedKernel;
 
 import java.io.EOFException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Stack;
 
 /**
  * Encapsulates the state of a user process that is not contained in its
@@ -55,11 +55,13 @@ public class UserProcess {
      */
     protected int numPages;
     protected int id;
+    protected OpenFile executable = null;
     private int initialPC, initialSP;
     private int argc, argv;
     private List<UserProcess> childList = new ArrayList<>();
-    private OpenFile[] fileTable;
+    private List<OpenFile> fileTable;
     private Semaphore joinSem;
+    private Stack<Integer> filePool = new Stack<>();
 
     /**
      * Allocate a new process.
@@ -67,16 +69,15 @@ public class UserProcess {
     public UserProcess() {
         id = UserKernel.getNewProcessID();
 
-        int numPhysPages = Machine.processor().getNumPhysPages();
-        pageTable = new TranslationEntry[numPhysPages];
-        for (int i = 0; i < numPhysPages; i++)
-            pageTable[i] = new TranslationEntry(i, i, true, false, false, false);
-
-
-        fileTable = new OpenFile[16];
-        fileTable[0] = UserKernel.console.openForReading();
-        fileTable[1] = UserKernel.console.openForWriting();
+        fileTable = new ArrayList<>();
+        fileTable.add(UserKernel.console.openForReading());
+        fileTable.add(UserKernel.console.openForWriting());
         joinSem = new Semaphore(0);
+
+        String filename = fileTable.get(0).getFileSystem() + "\0" + fileTable.get(0).getName();
+        UserKernel.openCount.put(filename, UserKernel.openCount.containsKey(filename) ? UserKernel.openCount.get(filename) + 1 : 1);
+        filename = fileTable.get(1).getFileSystem() + "\0" + fileTable.get(1).getName();
+        UserKernel.openCount.put(filename, UserKernel.openCount.containsKey(filename) ? UserKernel.openCount.get(filename) + 1 : 1);
     }
 
     /**
@@ -99,6 +100,7 @@ public class UserProcess {
      * @return <tt>true</tt> if the program was successfully executed.
      */
     public boolean execute(String name, String[] args) {
+        saveState();
         if (!load(name, args))
             return false;
 
@@ -182,14 +184,14 @@ public class UserProcess {
         Lib.assertTrue(offset >= 0 && length >= 0 && offset + length <= data.length);
 
         byte[] memory = Machine.processor().getMemory();
-
-        // for now, just assume that virtual addresses equal physical addresses
-        if (vaddr < 0 || vaddr >= memory.length)
+        if (vaddr < 0 || vaddr >= pageTable.length * pageSize) {
             return 0;
+        }
+        int amount = Math.min(length, pageTable.length * pageSize - vaddr);
 
-        int amount = Math.min(length, memory.length - vaddr);
-        System.arraycopy(memory, vaddr, data, offset, amount);
-
+        for (int i = vaddr; i < vaddr + amount; i = (i / pageSize + 1) * pageSize) {
+            System.arraycopy(memory, i + (pageTable[i / pageSize].ppn - i / pageSize) * pageSize, data, i - vaddr + offset, Math.min(vaddr + amount - i, pageSize - i % pageSize));
+        }
         return amount;
     }
 
@@ -225,14 +227,14 @@ public class UserProcess {
         Lib.assertTrue(offset >= 0 && length >= 0 && offset + length <= data.length);
 
         byte[] memory = Machine.processor().getMemory();
-
-        // for now, just assume that virtual addresses equal physical addresses
-        if (vaddr < 0 || vaddr >= memory.length)
+        if (vaddr < 0 || vaddr >= pageTable.length * pageSize) {
             return 0;
+        }
 
-        int amount = Math.min(length, memory.length - vaddr);
-        System.arraycopy(data, offset, memory, vaddr, amount);
-
+        int amount = Math.min(length, pageTable.length * pageSize - vaddr);
+        for (int i = vaddr; i < vaddr + amount; i = (i / pageSize + 1) * pageSize) {
+            System.arraycopy(data, i - vaddr + offset, memory, i + (pageTable[i / pageSize].ppn - i / pageSize) * pageSize, Math.min(vaddr + amount - i, pageSize - i % pageSize));
+        }
         return amount;
     }
 
@@ -249,11 +251,13 @@ public class UserProcess {
     private boolean load(String name, String[] args) {
         Lib.debug(dbgProcess, "UserProcess.load(\"" + name + "\")");
 
-        OpenFile executable = ThreadedKernel.fileSystem.open(name, false);
+        executable = ThreadedKernel.fileSystem.open(name, false);
         if (executable == null) {
             Lib.debug(dbgProcess, "\topen failed");
             return false;
         }
+        String filename = executable.getFileSystem() + "\0" + name;
+        UserKernel.openCount.put(filename, UserKernel.openCount.containsKey(filename) ? UserKernel.openCount.get(filename) + 1 : 1);
 
         try {
             coff = new Coff(executable);
@@ -337,6 +341,16 @@ public class UserProcess {
             return false;
         }
 
+        pageTable = new TranslationEntry[numPages];
+        int[] phyPages = UserKernel.getFreePages(numPages);
+        if (phyPages == null) {
+            Lib.debug(dbgProcess, "\tOut of memory");
+            return false;
+        }
+        for (int i = 0; i < numPages; i++) {
+            pageTable[i] = new TranslationEntry(i, phyPages[i], true, false, false, false);
+        }
+
         // load sections
         for (int s = 0; s < coff.getNumSections(); s++) {
             CoffSection section = coff.getSection(s);
@@ -346,9 +360,8 @@ public class UserProcess {
 
             for (int i = 0; i < section.getLength(); i++) {
                 int vpn = section.getFirstVPN() + i;
-
-                // for now, just assume virtual addresses=physical addresses
-                section.loadPage(i, vpn);
+                pageTable[vpn].readOnly = section.isReadOnly();
+                section.loadPage(i, pageTable[vpn].ppn);
             }
         }
 
@@ -359,6 +372,28 @@ public class UserProcess {
      * Release any resources allocated by <tt>loadSections()</tt>.
      */
     protected void unloadSections() {
+        int[] phyPages = new int[pageTable.length];
+        for (int i = 0; i < pageTable.length; ++i) {
+            phyPages[i] = pageTable[i].ppn;
+        }
+        UserKernel.pageFree(phyPages);
+
+        if (executable == null) {
+            return;
+        }
+
+        String filename = executable.getFileSystem() + "\0" + executable.getName();
+        if (UserKernel.openCount.get(filename) == 1) {
+            UserKernel.openCount.remove(filename);
+        } else {
+            UserKernel.openCount.put(filename, UserKernel.openCount.get(filename) - 1);
+        }
+        executable.close();
+
+        if (UserKernel.unlinking.contains(filename) && UserKernel.openCount.get(filename) == null) {
+            ThreadedKernel.fileSystem.remove(executable.getName());
+            UserKernel.unlinking.remove(filename);
+        }
     }
 
     /**
@@ -388,9 +423,12 @@ public class UserProcess {
      * Handle the halt() system call.
      */
     private int handleHalt() {
-        unloadSectionsAndCloseFile();
+        if (id != 0) {
+            Lib.debug(dbgProcess, "only the root process can halt the machine");
+            return 0;
+        }
 
-        Machine.halt();
+        Kernel.kernel.terminate();
 
         Lib.assertNotReached("Machine.halt() did not halt machine!");
         return 0;
@@ -420,9 +458,29 @@ public class UserProcess {
         String processName = readVirtualMemoryString(name, 256);
         boolean ret = child.execute(processName, args);
         if (!ret) {
+            child.clean();
             return -1;
         }
         return child.id;
+    }
+
+    private void clean() {
+        unloadSections();
+        for (int i = 0; i < fileTable.size(); i++) {
+            if (null != fileTable.get(i)) {
+                handleClose(i);
+            }
+        }
+        --UserKernel.processCount;
+        if (UserKernel.processCount == 0) {
+            Kernel.kernel.terminate();
+        }
+        joinSem.V();
+    }
+
+    private void kill() {
+        clean();
+        UThread.finish();
     }
 
     /**
@@ -431,19 +489,10 @@ public class UserProcess {
      * wakes parent if it joined, and finishes thread.
      * If this is the last process to exit, halt the machine
      */
-    private int handleExit(int exit) {
-        /* To Do: clear file table
-           store "exit" as this processes exit status
-           call V() on this processes join semaphore in case anyone is waiting */
-        unloadSectionsAndCloseFile();
-        exitStatus = exit;
-        joinSem.V();
-        // Done
-        if (id == 0) {
-            Machine.halt();
-        }
-        KThread.finish();
-        return exit;
+    private int handleExit(int status) {
+        this.exitStatus = status;
+        kill();
+        return 0;
     }
 
 
@@ -453,10 +502,6 @@ public class UserProcess {
      * returns exit status of process slept on
      */
     private int handleJoin(int pid) {
-        /* To Do: check that the given pid is in fact this process's
-           child, otherwise return -1
-           call P() on the child process's join semaphore
-           return the exit status of the CHILD process */
         for (UserProcess child : childList) {
             if (child.id == pid) {
                 child.joinSem.P();
@@ -470,19 +515,38 @@ public class UserProcess {
      * Handle the creat() system call.
      * Opens file, and clears it if it already exists.
      */
-    private int handleCreate(int name) {
-        String filename = readVirtualMemoryString(name, 256);
-        // catch -1? here
-        OpenFile theFile = Machine.stubFileSystem().open(filename, true);
-        if (theFile != null) {
-            for (int i = 2; i < fileTable.length; i++) {
-                if (fileTable[i] == null) {
-                    fileTable[i] = theFile;
-                    return i;
-                }
-            }
+    private int handleCreate(int vaddr) {
+        Lib.debug(dbgProcess, "creating from " + vaddr);
+        String filename = readVirtualMemoryString(vaddr, 256);
+        if (filename == null) {
+            Lib.debug(dbgProcess, "error while reading filename");
+            return -1;
         }
-        return -1;
+        Lib.debug(dbgProcess, "\tname is " + filename);
+
+        OpenFile file = ThreadedKernel.fileSystem.open(filename, true);
+        if (file == null) {
+            Lib.debug(dbgProcess, "error while creating file");
+            return -1;
+        }
+        filename = file.getFileSystem() + "\0" + file.getName();
+
+        if (UserKernel.unlinking.contains(filename)) {
+            Lib.debug(dbgProcess, "file has been unlinked");
+            return -1;
+        }
+        UserKernel.openCount.put(filename, UserKernel.openCount.containsKey(filename) ? UserKernel.openCount.get(filename) + 1 : 1);
+
+        int fd;
+        if (filePool.isEmpty()) {
+            fd = this.fileTable.size();
+            this.fileTable.add(file);
+        } else {
+            this.fileTable.set(fd = filePool.pop(), file);
+        }
+
+        Lib.debug(dbgProcess, "successfully creating file => " + fd);
+        return fd;
     }
 
     /**
@@ -490,18 +554,38 @@ public class UserProcess {
      * Tries to open file.
      * If it doesn't exist, returns -1.
      */
-    private int handleOpen(int name) {
-        String filename = readVirtualMemoryString(name, 256);
-        OpenFile theFile = Machine.stubFileSystem().open(filename, false);
-        if (theFile != null) {
-            for (int i = 2; i < fileTable.length; i++) {
-                if (fileTable[i] == null) {
-                    fileTable[i] = theFile;
-                    return i;
-                }
-            }
+    private int handleOpen(int vaddr) {
+        Lib.debug(dbgProcess, "opening from " + vaddr);
+        String filename = readVirtualMemoryString(vaddr, 256);
+        if (filename == null) {
+            Lib.debug(dbgProcess, "error while reading filename");
+            return -1;
         }
-        return -1;
+        Lib.debug(dbgProcess, "\tname is " + filename);
+
+        OpenFile file = ThreadedKernel.fileSystem.open(filename, false);
+        if (file == null) {
+            Lib.debug(dbgProcess, "error while opening file");
+            return -1;
+        }
+        filename = file.getFileSystem() + "\0" + file.getName();
+
+        if (UserKernel.unlinking.contains(filename)) {
+            Lib.debug(dbgProcess, "file has been unlinked");
+            return -1;
+        }
+        UserKernel.openCount.put(filename, UserKernel.openCount.containsKey(filename) ? UserKernel.openCount.get(filename) + 1 : 1);
+
+        int fd;
+        if (filePool.isEmpty()) {
+            fd = this.fileTable.size();
+            this.fileTable.add(file);
+        } else {
+            this.fileTable.set(fd = filePool.pop(), file);
+        }
+
+        Lib.debug(dbgProcess, "successfully opening file => " + fd);
+        return fd;
     }
 
     /**
@@ -510,15 +594,27 @@ public class UserProcess {
      * Replaces file with null in the fileTable.
      */
     private int handleClose(int fileDescriptor) {
-        OpenFile file = fileTable[fileDescriptor];
-        if (file != null) {
-            fileTable[fileDescriptor].close();
-            fileTable[fileDescriptor] = null;
-            return fileDescriptor;
+        OpenFile file;
+        if (fileDescriptor < 0 || fileDescriptor >= fileTable.size() || null == (file = fileTable.get(fileDescriptor))) {
+            Lib.debug(dbgProcess, "invalid file descriptor");
+            return -1;
+        }
+        String filename = file.getFileSystem() + "\0" + file.getName();
+        if (UserKernel.openCount.get(filename) == 1) {
+            UserKernel.openCount.remove(filename);
+        } else {
+            UserKernel.openCount.put(filename, UserKernel.openCount.get(filename) - 1);
         }
 
-        return -1;
+        file.close();
+        this.fileTable.set(fileDescriptor, null);
+        filePool.add(fileDescriptor);
 
+        if (UserKernel.unlinking.contains(filename) && UserKernel.openCount.get(filename) == null) {
+            ThreadedKernel.fileSystem.remove(file.getName());
+            UserKernel.unlinking.remove(filename);
+        }
+        return fileDescriptor;
     }
 
     /**
@@ -527,7 +623,7 @@ public class UserProcess {
      * Returns size of what was read.
      */
     private int handleRead(int fileDescriptor, int buffer, int size) {
-        OpenFile file = fileTable[fileDescriptor];
+        OpenFile file = fileTable.get(fileDescriptor);
         if (file == null) {
             return -1;
         }
@@ -548,7 +644,7 @@ public class UserProcess {
      * Returns the size of what was written.
      */
     private int handleWrite(int fileDescriptor, int buffer, int size) {
-        OpenFile file = fileTable[fileDescriptor];
+        OpenFile file = fileTable.get(fileDescriptor);
         if (file == null) {
             return -1;
         }
@@ -559,25 +655,32 @@ public class UserProcess {
         return sizeWritten;
     }
 
-    private int handleUnLink(int fileDescriptor) {
-        OpenFile file = fileTable[fileDescriptor];
-        if (file != null) {
-            fileTable[fileDescriptor].close();
-            fileTable[fileDescriptor] = null;
-            Machine.stubFileSystem().remove(file.getName());
+    private int handleUnLink(int vaddr) {
+        String filename = readVirtualMemoryString(vaddr, 256);
+        if (filename == null) {
+            Lib.debug(dbgProcess, "error while reading filename");
+            return -1;
+        }
+        Lib.debug(dbgProcess, "unlinking " + filename);
+
+        OpenFile file = Machine.stubFileSystem().open(filename, false);
+        if (file == null) {
+            Lib.debug(dbgProcess, "\terror while opening file");
+            return -1;
+        }
+        String name = filename;
+        filename = file.getFileSystem() + "\0" + file.getName();
+
+        if (UserKernel.unlinking.contains(filename)) {
             return 0;
         }
-        return -1;
-    }
 
-
-    private void unloadSectionsAndCloseFile() {
-        unloadSections();
-        for (int i = 2; i < fileTable.length; i++) {
-            if (fileTable[i] != null) {
-                fileTable[i].close();
-            }
+        if (UserKernel.openCount.get(filename) == null) {
+            return ThreadedKernel.fileSystem.remove(name) ? 0 : -1;
         }
+        UserKernel.unlinking.add(filename);
+
+        return 0;
     }
 
     /**
@@ -662,6 +765,15 @@ public class UserProcess {
                 );
                 processor.writeRegister(Processor.regV0, result);
                 processor.advancePC();
+                break;
+            case Processor.exceptionReadOnly:
+                Lib.debug(dbgProcess, "memory " + processor.readRegister(Processor.regBadVAddr) + " is read-only");
+                kill();
+                break;
+
+            case Processor.exceptionBusError:
+                Lib.debug(dbgProcess, "physical address " + processor.readRegister(Processor.regBadVAddr) + " out of bound");
+                kill();
                 break;
 
             default:

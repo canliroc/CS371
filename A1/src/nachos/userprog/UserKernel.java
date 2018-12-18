@@ -8,12 +8,13 @@ import nachos.threads.KThread;
 import nachos.threads.Semaphore;
 import nachos.threads.ThreadedKernel;
 
-import java.util.LinkedList;
+import java.util.*;
 
 /**
  * A kernel that can support multiple user processes.
  */
 public class UserKernel extends ThreadedKernel {
+    private static final char dbgProcess = 'a';
     /**
      * Globally accessible reference to the synchronized console.
      */
@@ -21,7 +22,10 @@ public class UserKernel extends ThreadedKernel {
     public static int newProcessID = 0;
     public static Semaphore processIDSem;
     public static Semaphore freePagesSem;
-    public static LinkedList<Integer> freePages = new LinkedList<Integer>();
+    public static Set<Integer> freePages = new HashSet<>();
+    protected static Map<String, Integer> openCount = new HashMap<>();
+    protected static Set<String> unlinking = new HashSet<>();
+    protected static int processCount = 0;
     // dummy variables to make javac smarter
     private static Coff dummy1 = null;
 
@@ -50,6 +54,60 @@ public class UserKernel extends ThreadedKernel {
         UserKernel.newProcessID++;
         UserKernel.processIDSem.V();
         return id;
+    }
+
+    public static int getFreePage() {
+        int page = -1;
+        freePagesSem.P();
+        Iterator<Integer> iterator = freePages.iterator();
+
+        if (!freePages.isEmpty()) {
+            page = iterator.next();
+            iterator.remove();
+        }
+
+        freePagesSem.V();
+        return page;
+    }
+
+    public static int[] getFreePages(int numOfPages) {
+        int[] pages = new int[numOfPages];
+
+        freePagesSem.P();
+        Iterator<Integer> iterator = freePages.iterator();
+        for (int i = 0; i < numOfPages; ++i) {
+            if (!iterator.hasNext()) {
+                pages = null;
+                break;
+            }
+            pages[i] = iterator.next();
+            iterator.remove();
+            Lib.debug(dbgProcess, "\t\tallocate physical page " + pages[i]);
+        }
+
+        freePagesSem.V();
+        return pages;
+    }
+
+    public static void pageFree(int[] pages) {
+        for (int page : pages) {
+            pageFree(page);
+        }
+    }
+
+    public static void pageFree(int page) {
+        freePagesSem.P();
+        Lib.assertTrue(page >= 0 && page < Machine.processor().getNumPhysPages(), "cannot free invalid physical page");
+        Lib.debug(dbgProcess, "\t\tfree physical page " + page);
+        freePages.add(page);
+        freePagesSem.V();
+    }
+
+    public static int pageRemain() {
+        freePagesSem.P();
+        int size = freePages.size();
+        freePagesSem.V();
+        return size;
     }
 
     /**
